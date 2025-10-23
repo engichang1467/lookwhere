@@ -77,6 +77,31 @@ with torch.no_grad():
     selector_map = lw.selector(image)["selector_map"]  # (bs, num_high_res_patches)
 ```
 
+Use LookWhere finetuned on ImageNet-1K at 224x224 px resolution.
+```bash
+wget https://huggingface.co/antofuller/lookwhere/resolve/main/is_LW=True_K=128_LR=1e-05_E=30.pt
+```
+
+```python
+lw = LookWhereDownstream(
+    pretrained_params_path="lookwhere_dinov2.pt",
+    high_res_size=224,
+    num_classes=1_000,
+    k=128,
+    is_cls=True,
+    device=gpu_id
+)
+weights = torch.load(
+    "is_LW=True_K=128_LR=1e-05_E=30.pt",
+    map_location="cpu",
+    weights_only=True,
+)
+lw.load_state_dict(weights)
+
+with torch.no_grad():
+    logits = lw(image)  # (bs, 1_000)
+```
+
 ## Pre-training (JAX / TPU)
 We ran all pre-training experiments on Google's TPUs. This code can be found in the directory: `original_jax_tpu_pretraining`
 

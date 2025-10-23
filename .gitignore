@@ -1,0 +1,9 @@
+# Ignore all Python bytecode cache folders anywhere
+__pycache__/
+**/__pycache__/
+
+# Ignore PyTorch model checkpoints and txt logs
+*.pt
+*.pth
+*.txt
+adversarial_attack.py
