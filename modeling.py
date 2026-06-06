@@ -3,6 +3,8 @@ import torch
 import timm
 from einops import rearrange
 import math
+import os
+import sys
 import torch.nn.functional as F
 import types
 from timm.layers.patch_embed import resample_patch_embed
@@ -10,6 +12,16 @@ from timm.models.vision_transformer import _create_vision_transformer
 from timm.layers import SwiGLUPacked
 
 from utils import interpolate_pos_encoding, upsample_grid_nn
+
+# SoftWhere (proposal P3): reuse the pure-PyTorch TokenLearner modules from the
+# sibling OpenTokenLearner repo. Import the module directly (not the package
+# root, which pulls in unrelated encoder/vit code). Zero extra deps beyond torch.
+_OTL_PATH = os.environ.get(
+    "OTL_PATH", "/home/michael/ProjectE2/OpenTokenLearner"
+)
+if _OTL_PATH not in sys.path:
+    sys.path.insert(0, _OTL_PATH)
+from tokenlearner.modules import TokenLearner, TokenLearnerV11  # noqa: E402
     
 
 class Extractor(nn.Module):
@@ -49,14 +61,20 @@ class Extractor(nn.Module):
         self.grid_size = img_size // patch_size
         self.to(device)
 
-    def forward(self, x, selector_prefix_tokens, keep_patch_indices, return_only_cls=False):
+    def forward(self, x, selector_prefix_tokens, keep_patch_indices, return_only_cls=False, keep_gate=None):
         x = self.model.patch_embed(x)  # (bs, num_patches, dim)
         x = x + self.model.pos_embed  # (bs, num_patches, dim)
 
         # keep_patch_indices: (bs, k)
         batch_range = torch.arange(x.shape[0], device = x.device)[:, None]
         x = x[batch_range, keep_patch_indices] # (bs, k, dim)
-                
+
+        # SoftWhere (P3): optional straight-through gate on the kept patch
+        # embeddings, so gradients flow from the extractor loss back to the
+        # selector. keep_gate: (bs, k, 1). Identity (==1) by default => no-op.
+        if keep_gate is not None:
+            x = x * keep_gate
+
         num_prefix = selector_prefix_tokens.shape[1]
 
         x = torch.cat([
@@ -93,10 +111,58 @@ class SelectorHead(nn.Module):
         return self.w2(F.gelu(self.w1(x)))
 
 
+class TokenLearnerSelectorHead(nn.Module):
+    """Differentiable multi-foveal selector head (SoftWhere, proposal P3).
+
+    Drop-in replacement for `SelectorHead`. Instead of a per-patch MLP that
+    emits `resolution_multiplier**2` super-resolution logits, a TokenLearner
+    emits `num_tokens` (= S) soft spatial attention maps over the low-res
+    selector grid. The S maps are aggregated into a single importance map of
+    shape (B, 1, g, g) where g = sqrt(num_patches); `Selector.forward` then
+    upsamples it to the high-res grid (variant A: bypass the (i j) rearrange,
+    since these maps are already spatial attention over the grid).
+
+    The per-token maps are cached in `self._last_attn` (B, S, g, g) for the
+    multi-foveal visualization.
+    """
+
+    def __init__(self, dim, num_tokens=4, variant="v10", agg="max"):
+        super().__init__()
+        assert variant in ("v10", "v11")
+        assert agg in ("max", "mean", "logsumexp")
+        self.variant = variant
+        self.agg = agg
+        self.num_tokens = num_tokens
+        if variant == "v10":
+            self.tl = TokenLearner(in_channels=dim, num_tokens=num_tokens)
+        else:
+            self.tl = TokenLearnerV11(in_channels=dim, num_tokens=num_tokens)
+        self._last_attn = None
+
+    def forward(self, x):
+        # x: (B, N, dim), N a perfect square (the low-res selector grid).
+        b, n, _ = x.shape
+        g = int(math.isqrt(n))
+        _, attn = self.tl(x, return_attn=True)
+        if attn.dim() == 3:  # v11 returns [B, S, HW]; reshape to [B, S, g, g]
+            attn = attn.reshape(b, self.num_tokens, g, g)
+        self._last_attn = attn  # [B, S, g, g]
+
+        if self.agg == "max":
+            importance = attn.amax(dim=1, keepdim=True)
+        elif self.agg == "mean":
+            importance = attn.mean(dim=1, keepdim=True)
+        else:  # logsumexp = differentiable soft union of the S maps
+            importance = torch.logsumexp(attn, dim=1, keepdim=True)
+        return importance  # [B, 1, g, g]
+
+
 class Selector(nn.Module):
-    def __init__(self, pretrained_params, lw_type, hr_size, device):
+    def __init__(self, pretrained_params, lw_type, hr_size, device,
+                 head_type="mlp", num_tokens=4, tl_variant="v10", tl_agg="max"):
         super().__init__()
         assert lw_type in ["franca", "dinov2"]
+        assert head_type in ["mlp", "tokenlearner"]
         depth = 3  # our selector is shallow / fast!
         patch_size = 14
         img_size = 154  # hard-coded because we don't fine-tune the selector thus it will be bad if we use other img_size
@@ -126,9 +192,18 @@ class Selector(nn.Module):
         self.resolution_multiplier = math.ceil(37 / self.input_grid_size)  # (518/14)^2=37
         num_output = int(self.resolution_multiplier * self.resolution_multiplier)
 
-        self.head = SelectorHead(dim=self.model.embed_dim, num_output=num_output)
-        self.head.load_state_dict(pretrained_params["head"])
-        
+        self.head_type = head_type
+        if head_type == "mlp":
+            self.head = SelectorHead(dim=self.model.embed_dim, num_output=num_output)
+            self.head.load_state_dict(pretrained_params["head"])
+        else:  # tokenlearner: randomly initialized; pretrained MLP head intentionally not loaded
+            self.head = TokenLearnerSelectorHead(
+                dim=self.model.embed_dim,
+                num_tokens=num_tokens,
+                variant=tl_variant,
+                agg=tl_agg,
+            )
+
         self.to(device)
     
     def forward(self, x):
@@ -158,15 +233,20 @@ class Selector(nn.Module):
         prefix_tokens = x[:, :num_prefix, :]  # (bs, num_prefix, dim)
         patch_tokens = x[:, num_prefix:, :]  # (bs, num_patches, dim)
 
-        selector_map = self.head(patch_tokens)  # (bs, num_patches, num_output)
-        selector_map = rearrange(
-            selector_map,
-            "b (h w) (i j) -> b 1 (h i) (w j)",
-            h=self.input_grid_size,
-            w=self.input_grid_size,
-            i=self.resolution_multiplier,
-            j=self.resolution_multiplier
-        )
+        if self.head_type == "mlp":
+            selector_map = self.head(patch_tokens)  # (bs, num_patches, num_output)
+            selector_map = rearrange(
+                selector_map,
+                "b (h w) (i j) -> b 1 (h i) (w j)",
+                h=self.input_grid_size,
+                w=self.input_grid_size,
+                i=self.resolution_multiplier,
+                j=self.resolution_multiplier
+            )
+        else:
+            # TokenLearner head returns the aggregated importance map already at
+            # (bs, 1, input_grid_size, input_grid_size); skip the (i j) rearrange.
+            selector_map = self.head(patch_tokens)
         selector_map = F.interpolate(selector_map, size=(self.target_grid_size, self.target_grid_size), mode='bilinear', align_corners=False)
         selector_map = rearrange(selector_map, "b 1 h w -> b (h w)")
         
@@ -178,7 +258,8 @@ class Selector(nn.Module):
 
 
 class LookWhereDownstream(nn.Module):
-    def __init__(self, pretrained_params_path, high_res_size, num_classes, k, is_cls, device):
+    def __init__(self, pretrained_params_path, high_res_size, num_classes, k, is_cls, device,
+                 head_type="mlp", num_tokens=4, tl_variant="v10", tl_agg="max"):
         super().__init__()
         # supports classification (1 prediction per image) and segmentation (1 prediction per patch)
 
@@ -193,7 +274,11 @@ class LookWhereDownstream(nn.Module):
             pretrained_params=all_pretrained_params["selector"],
             lw_type=self.lw_type,
             hr_size=high_res_size,
-            device=device
+            device=device,
+            head_type=head_type,
+            num_tokens=num_tokens,
+            tl_variant=tl_variant,
+            tl_agg=tl_agg,
         )
         self.extractor = Extractor(
             pretrained_params=all_pretrained_params["extractor"],

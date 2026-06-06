@@ -1,3 +1,5 @@
+personal/
+
 # Ignore all Python bytecode cache folders anywhere
 __pycache__/
 **/__pycache__/
@@ -6,4 +8,5 @@ __pycache__/
 *.pt
 *.pth
 *.txt
+*.png
 adversarial_attack.py
