@@ -5,6 +5,7 @@ from einops import rearrange
 import math
 import os
 import sys
+from pathlib import Path
 import torch.nn.functional as F
 import types
 from timm.layers.patch_embed import resample_patch_embed
@@ -17,7 +18,8 @@ from utils import interpolate_pos_encoding, upsample_grid_nn
 # sibling OpenTokenLearner repo. Import the module directly (not the package
 # root, which pulls in unrelated encoder/vit code). Zero extra deps beyond torch.
 _OTL_PATH = os.environ.get(
-    "OTL_PATH", "/home/michael/ProjectE2/OpenTokenLearner"
+    "OTL_PATH",
+    str(Path(__file__).resolve().parents[1] / "Open-TokenLearner"),
 )
 if _OTL_PATH not in sys.path:
     sys.path.insert(0, _OTL_PATH)
