@@ -1,4 +1,5 @@
 personal/
+ade_data/
 
 # Ignore all Python bytecode cache folders anywhere
 __pycache__/
