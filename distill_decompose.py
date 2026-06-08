@@ -50,6 +50,10 @@ parser.add_argument("--diversity", type=float, default=0.0,
                     help="weight on the cross-map diversity regularizer")
 parser.add_argument("--n_images", type=int, default=16)
 parser.add_argument("--batch_size", type=int, default=4)
+parser.add_argument("--image_glob", default=None,
+                    help="override image source (e.g. ADE20K train) for in-domain "
+                         "distillation; default = ice_cream + imagenette val")
+parser.add_argument("--tag", default="", help="extra suffix on the saved filename")
 args = parser.parse_args()
 
 grid = high_res_img_size // 14
@@ -63,9 +67,12 @@ transform = transforms.Compose([
                          std=torch.tensor([0.229, 0.224, 0.225])),
 ])
 
-# --- small image set: ice_cream + a handful from imagenette val ---
-paths = ["ice_cream.jpg"]
-paths += sorted(glob.glob(os.path.join(imagenette_val, "*", "*.JPEG")))[: args.n_images - 1]
+# --- small image set: ice_cream + imagenette val, or a custom --image_glob ---
+if args.image_glob:
+    paths = sorted(glob.glob(args.image_glob))[: args.n_images]
+else:
+    paths = ["ice_cream.jpg"]
+    paths += sorted(glob.glob(os.path.join(imagenette_val, "*", "*.JPEG")))[: args.n_images - 1]
 images = torch.stack([transform(Image.open(p).convert("RGB")) for p in paths]).to(device)
 print(f"distilling on {len(images)} images, variant={args.variant}, "
       f"S={args.num_tokens}, steps={args.steps}")
@@ -121,7 +128,9 @@ for step in range(args.steps):
     if step % 50 == 0 or step == args.steps - 1:
         print(f"  step {step:4d}  kl={loss.item():.5f}")
 
-out = f"softwhere_head_{args.variant}.pt"
+# filename tags variant + diversity weight so a sweep does not overwrite.
+div_tag = f"_div{args.diversity:g}"
+out = f"softwhere_head_{args.variant}{div_tag}{args.tag}.pt"
 torch.save(head.state_dict(), out)
 print(f"\nsaved distilled head -> {out}")
 print(f"render with:  .venv/bin/python experiment_softwhere.py --distilled {out}")
