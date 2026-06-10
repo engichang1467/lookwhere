@@ -121,25 +121,52 @@ class TokenLearnerSelectorHead(nn.Module):
     emits `num_tokens` (= S) soft spatial attention maps over the low-res
     selector grid. The S maps are aggregated into a single importance map of
     shape (B, 1, g, g) where g = sqrt(num_patches); `Selector.forward` then
-    upsamples it to the high-res grid (variant A: bypass the (i j) rearrange,
-    since these maps are already spatial attention over the grid).
+    upsamples it to the high-res grid.
 
-    The per-token maps are cached in `self._last_attn` (B, S, g, g) for the
-    multi-foveal visualization.
+    For the resolution-parity experiment, `sr_mode="conv"` adds a small
+    super-resolution refiner over the S maps and returns a (B, 1, g*r, g*r)
+    aggregate before final interpolation. This mirrors the MLP head's
+    `(i j)` rearrange capacity without changing the selector backbone.
+
+    The per-token maps are cached in `self._last_attn` (B, S, g, g) and, when
+    enabled, `self._last_attn_sr` (B, S, g*r, g*r) for coverage diagnostics.
     """
 
-    def __init__(self, dim, num_tokens=4, variant="v10", agg="max"):
+    def __init__(self, dim, num_tokens=4, variant="v10", agg="max",
+                 sr_mode="none", sr_ratio=1, sr_hidden=32):
         super().__init__()
         assert variant in ("v10", "v11")
         assert agg in ("max", "mean", "logsumexp")
+        assert sr_mode in ("none", "conv")
+        assert sr_ratio >= 1
         self.variant = variant
         self.agg = agg
         self.num_tokens = num_tokens
+        self.sr_mode = sr_mode
+        self.sr_ratio = sr_ratio
         if variant == "v10":
             self.tl = TokenLearner(in_channels=dim, num_tokens=num_tokens)
         else:
             self.tl = TokenLearnerV11(in_channels=dim, num_tokens=num_tokens)
+        if sr_mode == "conv":
+            hidden = max(sr_hidden, num_tokens * 4)
+            self.sr_refine = nn.Sequential(
+                nn.Conv2d(num_tokens, hidden, kernel_size=3, padding=1, bias=False),
+                nn.GELU(),
+                nn.Conv2d(hidden, num_tokens * sr_ratio * sr_ratio, kernel_size=1),
+            )
+        else:
+            self.sr_refine = None
         self._last_attn = None
+        self._last_attn_sr = None
+
+    def _aggregate(self, attn):
+        if self.agg == "max":
+            return attn.amax(dim=1, keepdim=True)
+        if self.agg == "mean":
+            return attn.mean(dim=1, keepdim=True)
+        # logsumexp = differentiable soft union of the S maps.
+        return torch.logsumexp(attn, dim=1, keepdim=True)
 
     def forward(self, x):
         # x: (B, N, dim), N a perfect square (the low-res selector grid).
@@ -149,19 +176,27 @@ class TokenLearnerSelectorHead(nn.Module):
         if attn.dim() == 3:  # v11 returns [B, S, HW]; reshape to [B, S, g, g]
             attn = attn.reshape(b, self.num_tokens, g, g)
         self._last_attn = attn  # [B, S, g, g]
+        self._last_attn_sr = None
 
-        if self.agg == "max":
-            importance = attn.amax(dim=1, keepdim=True)
-        elif self.agg == "mean":
-            importance = attn.mean(dim=1, keepdim=True)
-        else:  # logsumexp = differentiable soft union of the S maps
-            importance = torch.logsumexp(attn, dim=1, keepdim=True)
-        return importance  # [B, 1, g, g]
+        if self.sr_refine is not None:
+            sr = self.sr_refine(attn)
+            sr = rearrange(
+                sr,
+                "b (s i j) h w -> b s (h i) (w j)",
+                s=self.num_tokens,
+                i=self.sr_ratio,
+                j=self.sr_ratio,
+            )
+            attn = F.softplus(sr) + 1e-6
+            self._last_attn_sr = attn
+
+        return self._aggregate(attn)  # [B, 1, g, g] or [B, 1, g*r, g*r]
 
 
 class Selector(nn.Module):
     def __init__(self, pretrained_params, lw_type, hr_size, device,
-                 head_type="mlp", num_tokens=4, tl_variant="v10", tl_agg="max"):
+                 head_type="mlp", num_tokens=4, tl_variant="v10", tl_agg="max",
+                 tl_sr_mode="none", tl_sr_ratio=None, tl_sr_hidden=32):
         super().__init__()
         assert lw_type in ["franca", "dinov2"]
         assert head_type in ["mlp", "tokenlearner"]
@@ -204,6 +239,9 @@ class Selector(nn.Module):
                 num_tokens=num_tokens,
                 variant=tl_variant,
                 agg=tl_agg,
+                sr_mode=tl_sr_mode,
+                sr_ratio=tl_sr_ratio or self.resolution_multiplier,
+                sr_hidden=tl_sr_hidden,
             )
 
         self.to(device)
@@ -261,7 +299,8 @@ class Selector(nn.Module):
 
 class LookWhereDownstream(nn.Module):
     def __init__(self, pretrained_params_path, high_res_size, num_classes, k, is_cls, device,
-                 head_type="mlp", num_tokens=4, tl_variant="v10", tl_agg="max"):
+                 head_type="mlp", num_tokens=4, tl_variant="v10", tl_agg="max",
+                 tl_sr_mode="none", tl_sr_ratio=None, tl_sr_hidden=32):
         super().__init__()
         # supports classification (1 prediction per image) and segmentation (1 prediction per patch)
 
@@ -281,6 +320,9 @@ class LookWhereDownstream(nn.Module):
             num_tokens=num_tokens,
             tl_variant=tl_variant,
             tl_agg=tl_agg,
+            tl_sr_mode=tl_sr_mode,
+            tl_sr_ratio=tl_sr_ratio,
+            tl_sr_hidden=tl_sr_hidden,
         )
         self.extractor = Extractor(
             pretrained_params=all_pretrained_params["extractor"],
