@@ -14,9 +14,12 @@ Example:
   .venv/bin/python mini_end_to_end.py --tl-sr-mode conv --steps 1000
 """
 import argparse
+import os
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+import wandb
 
 from modeling import LookWhereDownstream
 from softwhere_experiment_utils import (
@@ -25,6 +28,17 @@ from softwhere_experiment_utils import (
     diversity_loss_from_head,
     image_transform,
     load_batch,
+)
+
+
+WANDB_TAGS = [
+    tag.strip()
+    for tag in os.environ.get("WANDB_TAGS", "").split(",")
+    if tag.strip()
+]
+WANDB_LOG_ARTIFACT = (
+    os.environ.get("WANDB_LOG_ARTIFACT", "true").lower()
+    not in {"0", "false", "no"}
 )
 
 
@@ -51,7 +65,91 @@ def parse_args():
     parser.add_argument("--init-head", default=None,
                         help="optional distilled TokenLearner head checkpoint")
     parser.add_argument("--out", default=None)
+    parser.add_argument("--log-every", type=int, default=25)
     return parser.parse_args()
+
+
+def default_output_path(args):
+    if args.out is not None:
+        return args.out
+    sr = "sr" if args.tl_sr_mode == "conv" else "lowres"
+    return f"softwhere_head_{args.variant}_{sr}_mini_e2e.pt"
+
+
+def wandb_config(args, device, grid, k, image_count, out):
+    config = {
+        key: value
+        for key, value in vars(args).items()
+        if key not in {"image_glob", "out"}
+    }
+    config.update({
+        "checkpoint": Path(args.checkpoint).name if args.checkpoint else None,
+        "init_head": Path(args.init_head).name if args.init_head else None,
+        "output_checkpoint": Path(out).name,
+        "image_glob_provided": args.image_glob is not None,
+        "image_count": image_count,
+        "device": device,
+        "high_res": DEFAULT_HIGH_RES,
+        "grid": grid,
+        "k": k,
+    })
+    return config
+
+
+def init_wandb(args, device, grid, k, image_count, out) -> wandb.sdk.wandb_run.Run:
+    """Initialize wandb, following the Open-TokenLearner training pattern."""
+    run = wandb.init(
+        project=os.environ.get("WANDB_PROJECT", "softwhere"),
+        entity=os.environ.get("WANDB_ENTITY"),
+        name=os.environ.get("WANDB_NAME") or Path(out).stem,
+        group=os.environ.get("WANDB_GROUP"),
+        tags=WANDB_TAGS or None,
+        job_type="mini-end-to-end-train",
+        config=wandb_config(args, device, grid, k, image_count, out),
+        mode=os.environ.get("WANDB_MODE", "online"),
+    )
+    run.define_metric("train/step")
+    run.define_metric("train/*", step_metric="train/step")
+    run.define_metric("final/*")
+    return run
+
+
+def log_training_metrics(run, step, loss, parts, grad_norm, opt):
+    metrics = {
+        "train/step": step,
+        "train/total_loss": loss.detach().float().item(),
+        "train/grad_norm": float(grad_norm.detach().float().item()),
+        "train/lr": opt.param_groups[0]["lr"],
+    }
+    metrics.update({
+        f"train/{name}_loss": value.detach().float().item()
+        for name, value in parts.items()
+    })
+    wandb.log(metrics)
+    run.summary.update({
+        key.replace("train/", "final/"): value
+        for key, value in metrics.items()
+        if key.startswith("train/") and key != "train/step"
+    })
+
+
+def log_checkpoint_artifact(run, out, args, k, final_metrics):
+    if not WANDB_LOG_ARTIFACT or os.environ.get("WANDB_MODE") == "disabled":
+        return
+    metadata = {key.replace("final/", ""): value for key, value in final_metrics.items()}
+    artifact = wandb.Artifact(
+        name=f"softwhere-mini-e2e-{run.id}",
+        type="model",
+        metadata={
+            "variant": args.variant,
+            "num_tokens": args.num_tokens,
+            "tl_sr_mode": args.tl_sr_mode,
+            "k": k,
+            **metadata,
+        },
+    )
+    artifact.add_file(out, name=Path(out).name)
+    run.log_artifact(artifact, aliases=["latest"])
 
 
 def make_softwhere(args, device, k, is_cls=True):
@@ -145,49 +243,70 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     grid = DEFAULT_HIGH_RES // 14
     k = int(args.k_ratio * grid * grid)
+    out = default_output_path(args)
 
     paths = collect_image_paths(args.image_glob, args.n_images, include_ice_cream=args.image_glob is None)
     if not paths:
         raise SystemExit("no training images found")
     transform = image_transform(DEFAULT_HIGH_RES)
 
-    teacher = LookWhereDownstream(args.checkpoint, DEFAULT_HIGH_RES, 0, k, True, device, head_type="mlp")
-    teacher.eval()
-    for p in teacher.parameters():
-        p.requires_grad_(False)
+    with init_wandb(args, device, grid, k, len(paths), out) as run:
+        teacher = LookWhereDownstream(args.checkpoint, DEFAULT_HIGH_RES, 0, k, True, device, head_type="mlp")
+        teacher.eval()
+        for p in teacher.parameters():
+            p.requires_grad_(False)
 
-    student = make_softwhere(args, device, k, is_cls=True)
-    if args.init_head:
-        student.selector.head.load_state_dict(torch.load(args.init_head, map_location=device, weights_only=True))
-        print(f"initialized head from {args.init_head}")
-    head = freeze_for_head_training(student)
-    student.eval()
-    student.selector.train()
+        student = make_softwhere(args, device, k, is_cls=True)
+        if args.init_head:
+            student.selector.head.load_state_dict(torch.load(args.init_head, map_location=device, weights_only=True))
+            print(f"initialized head from {args.init_head}")
+        head = freeze_for_head_training(student)
+        student.eval()
+        student.selector.train()
 
-    opt = torch.optim.AdamW(head.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    print(f"training SoftWhere head on {len(paths)} images, steps={args.steps}, k={k}, tl_sr_mode={args.tl_sr_mode}")
+        opt = torch.optim.AdamW(head.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        print(f"training SoftWhere head on {len(paths)} images, steps={args.steps}, k={k}, tl_sr_mode={args.tl_sr_mode}")
 
-    for step in range(args.steps):
-        idx = torch.randint(0, len(paths), (args.batch_size,))
-        batch_paths = [paths[i] for i in idx.tolist()]
-        images = load_batch(batch_paths, transform, device)
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")):
-            loss, parts = train_step(args, teacher, student, images, k)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(head.parameters(), 1.0)
-        opt.step()
-        opt.zero_grad()
+        final_metrics = {
+            "final/steps": args.steps,
+            "final/image_count": len(paths),
+            "final/k": k,
+        }
+        for step in range(args.steps):
+            idx = torch.randint(0, len(paths), (args.batch_size,))
+            batch_paths = [paths[i] for i in idx.tolist()]
+            images = load_batch(batch_paths, transform, device)
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")):
+                loss, parts = train_step(args, teacher, student, images, k)
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(head.parameters(), 1.0)
+            opt.step()
+            opt.zero_grad()
 
-        if step % 25 == 0 or step == args.steps - 1:
-            msg = " ".join(f"{name}={value.detach().float().item():.4f}" for name, value in parts.items())
-            print(f"step={step:05d} total={loss.detach().float().item():.4f} {msg}")
+            final_metrics = {
+                "final/total_loss": loss.detach().float().item(),
+                "final/grad_norm": float(grad_norm.detach().float().item()),
+                "final/lr": opt.param_groups[0]["lr"],
+                "final/steps": args.steps,
+                "final/image_count": len(paths),
+                "final/k": k,
+            }
+            final_metrics.update({
+                f"final/{name}_loss": value.detach().float().item()
+                for name, value in parts.items()
+            })
 
-    out = args.out
-    if out is None:
-        sr = "sr" if args.tl_sr_mode == "conv" else "lowres"
-        out = f"softwhere_head_{args.variant}_{sr}_mini_e2e.pt"
-    torch.save(head.state_dict(), out)
-    print(f"saved {out}")
+            if args.log_every > 0 and (step % args.log_every == 0 or step == args.steps - 1):
+                msg = " ".join(f"{name}={value.detach().float().item():.4f}" for name, value in parts.items())
+                print(f"step={step:05d} total={loss.detach().float().item():.4f} {msg}")
+                log_training_metrics(run, step, loss, parts, grad_norm, opt)
+
+        wandb.log(final_metrics)
+        run.summary.update(final_metrics)
+
+        torch.save(head.state_dict(), out)
+        print(f"saved {out}")
+        log_checkpoint_artifact(run, out, args, k, final_metrics)
 
 
 if __name__ == "__main__":

@@ -46,6 +46,10 @@ parser.add_argument("--image", default=image_path)
 parser.add_argument("--distilled", default=None,
                     help="path to a distilled TokenLearner head state_dict (.pt); "
                          "if given, the variant is inferred from the filename")
+parser.add_argument("--variant", choices=["auto", "v10", "v11"], default="auto")
+parser.add_argument("--num-tokens", type=int, default=num_tokens)
+parser.add_argument("--tl-agg", choices=["max", "mean", "logsumexp"], default="max")
+parser.add_argument("--tl-sr-mode", choices=["none", "conv"], default="none")
 args = parser.parse_args()
 
 num_patches = (high_res_img_size // 14) ** 2
@@ -91,7 +95,8 @@ with torch.no_grad():
 def render(variant):
     lw_tl = LookWhereDownstream(checkpoint, high_res_size=high_res_img_size, num_classes=0,
                                 k=k, is_cls=True, device=device, head_type="tokenlearner",
-                                num_tokens=num_tokens, tl_variant=variant, tl_agg="max")
+                                num_tokens=args.num_tokens, tl_variant=variant,
+                                tl_agg=args.tl_agg, tl_sr_mode=args.tl_sr_mode)
     tag = "untrained"
     if args.distilled:
         sd = torch.load(args.distilled, map_location=device, weights_only=True)
@@ -101,7 +106,10 @@ def render(variant):
     with torch.no_grad():
         sel = lw_tl.selector(image)
         agg = sel["selector_map"].reshape(grid, grid).float().cpu().numpy()
-        attn = lw_tl.selector.head._last_attn[0].float().cpu().numpy()  # (S, 11, 11)
+        attn_t = getattr(lw_tl.selector.head, "_last_attn_sr", None)
+        if attn_t is None:
+            attn_t = lw_tl.selector.head._last_attn
+        attn = attn_t[0].float().cpu().numpy()
     S = attn.shape[0]
 
     ncols = 3 + S
@@ -113,14 +121,17 @@ def render(variant):
         show_overlay(axes[3 + s], attn[s], f"foveal map {s + 1}")
     fig.suptitle(f"SoftWhere multi-foveal selector — {variant} ({tag})", fontsize=11)
     fig.tight_layout(rect=(0, 0, 1, 0.94))
-    out_path = f"softwhere_{variant}_{tag}.png"
+    sr_tag = "_sr" if args.tl_sr_mode == "conv" else ""
+    out_path = f"softwhere_{variant}{sr_tag}_{tag}.png"
     fig.savefig(out_path, dpi=130, bbox_inches="tight")
     plt.close(fig)
     print(f"saved {out_path}  (input + LookWhere + agg + {S} foveal maps)")
 
 
 variants = ["v10", "v11"]
-if args.distilled:  # infer single variant from filename to load matching weights
+if args.variant != "auto":
+    variants = [args.variant]
+elif args.distilled:  # infer single variant from filename to load matching weights
     variants = ["v11" if "v11" in args.distilled else "v10"]
 for v in variants:
     render(v)
